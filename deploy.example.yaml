@@ -1,0 +1,129 @@
+# Minimal example for deploying k3s-status-dashboard on Kubernetes / k3s.
+#
+# It needs read-only access to the cluster API: nodes, ingresses, services and
+# endpoints (and optionally Traefik IngressRoute CRDs). The ServiceAccount +
+# ClusterRole below grant exactly that — nothing that can create, update or
+# delete anything.
+#
+#   kubectl apply -f deploy.example.yaml
+#
+# Then reach it via port-forward, a Service of type LoadBalancer, or your own
+# Ingress (an example Ingress is included at the bottom, commented out).
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: status
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: status-dashboard
+  namespace: status
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: status-dashboard-read
+rules:
+  - apiGroups: [""]
+    resources: ["nodes", "services", "endpoints"]
+    verbs: ["get", "list"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses"]
+    verbs: ["get", "list"]
+  # Optional: Traefik IngressRoute-Erkennung. Schadet nicht, wenn das CRD fehlt.
+  - apiGroups: ["traefik.io", "traefik.containo.us"]
+    resources: ["ingressroutes"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: status-dashboard-read
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: status-dashboard-read
+subjects:
+  - kind: ServiceAccount
+    name: status-dashboard
+    namespace: status
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: status-dashboard
+  namespace: status
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: status-dashboard
+  template:
+    metadata:
+      labels:
+        app: status-dashboard
+    spec:
+      serviceAccountName: status-dashboard
+      containers:
+        - name: status-dashboard
+          image: schnippi78/k3s-status-dashboard:latest
+          ports:
+            - containerPort: 3000
+          env:
+            - name: DASHBOARD_TITLE
+              value: "My Homelab Status"
+            # Optional: nur einen Namespace anzeigen
+            # - name: NAMESPACE
+            #   value: "default"
+            # Optional: kuratierte Config inline (statt Auto-Modus)
+            # - name: SERVICES_CONFIG
+            #   value: '{"title":"Inline","services":[{"name":"Pi","host":"pi.example.com"}]}'
+          # Optional: kuratierte Config aus einer ConfigMap mounten
+          # volumeMounts:
+          #   - name: config
+          #     mountPath: /app/config.json
+          #     subPath: config.json
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 64Mi
+      # volumes:
+      #   - name: config
+      #     configMap:
+      #       name: status-dashboard-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: status-dashboard
+  namespace: status
+spec:
+  selector:
+    app: status-dashboard
+  ports:
+    - port: 80
+      targetPort: 3000
+# ---
+# Optional: expose via Ingress (Traefik). Put it behind auth before opening it
+# to the public internet — the dashboard has no auth of its own.
+# apiVersion: networking.k8s.io/v1
+# kind: Ingress
+# metadata:
+#   name: status-dashboard
+#   namespace: status
+# spec:
+#   rules:
+#     - host: status.example.com
+#       http:
+#         paths:
+#           - path: /
+#             pathType: Prefix
+#             backend:
+#               service:
+#                 name: status-dashboard
+#                 port:
+#                   number: 80

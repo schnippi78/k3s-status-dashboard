@@ -1,0 +1,8 @@
+{
+  "title": "My Homelab Status",
+  "services": [
+    { "name": "Nextcloud", "host": "cloud.example.com" },
+    { "name": "PiHole", "host": "pihole.example.com" },
+    { "name": "Mail", "k8sServices": ["mail/front", "mail/imap", "mail/smtp"] }
+  ]
+}

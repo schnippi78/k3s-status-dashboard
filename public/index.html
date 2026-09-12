@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>k3s Status</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --border: #23262e;
+    --text: #f3f4f6;
+    --muted: #8b93a3;
+    --ok: #3ddc84;
+    --warn: #f5c451;
+    --down: #f06868;
+    --unknown: #565d6b;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    padding: 3rem 1.5rem 4rem;
+  }
+  main { max-width: 640px; margin: 0 auto; }
+  h1 {
+    font-size: 2.75rem;
+    font-weight: 800;
+    margin: 0 0 0.5rem;
+    letter-spacing: -0.02em;
+  }
+  .subtitle {
+    color: var(--muted);
+    font-size: 0.95rem;
+    margin-bottom: 2.5rem;
+  }
+  h2 {
+    font-size: 1.6rem;
+    font-weight: 800;
+    letter-spacing: -0.01em;
+    color: var(--text);
+    margin: 2.75rem 0 0.5rem;
+    padding-bottom: 0.75rem;
+    border-bottom: 1px solid var(--border);
+  }
+  ul { list-style: none; margin: 0; padding: 0; }
+  li {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75rem;
+    padding: 1rem 0.1rem;
+    border-bottom: 1px solid var(--border);
+    font-size: 1rem;
+  }
+  li:last-child { border-bottom: none; }
+  .left { display: flex; align-items: center; gap: 0.7rem; min-width: 0; }
+  .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+  .meta { color: var(--muted); font-size: 0.85rem; }
+  .dot {
+    width: 10px; height: 10px; border-radius: 50%;
+    flex-shrink: 0;
+  }
+  .dot.ok { background: var(--ok); }
+  .dot.eingeschränkt { background: var(--warn); }
+  .dot.down { background: var(--down); }
+  .dot.ready { background: var(--ok); }
+  .dot.unbekannt { background: var(--unknown); }
+  .label {
+    font-size: 0.78rem;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+  footer {
+    margin-top: 3rem;
+    color: var(--muted);
+    font-size: 0.8rem;
+    display: flex;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+  }
+  footer a { color: var(--muted); text-decoration: underline; }
+  .error {
+    color: var(--down);
+    font-size: 0.85rem;
+    margin-bottom: 1rem;
+  }
+</style>
+</head>
+<body>
+<main>
+  <h1 id="title">k3s Status</h1>
+  <div class="subtitle">lädt…</div>
+
+  <div id="error"></div>
+
+  <h2>Services</h2>
+  <ul id="services"></ul>
+
+  <h2>Nodes</h2>
+  <ul id="nodes"></ul>
+
+  <footer>
+    <span id="updated"></span>
+    <span>Auto-Refresh alle 30 s · <a href="/api/status">JSON</a></span>
+  </footer>
+</main>
+
+<script>
+const REFRESH_MS = 30000;
+
+function renderService(s) {
+  return `<li>
+    <div class="left">
+      <span class="dot ${s.status}"></span>
+      <span class="name">${s.name}</span>
+    </div>
+    <span class="meta">${s.running}/${s.desired}</span>
+  </li>`;
+}
+
+function renderNode(n) {
+  const typeLabel = n.type ? n.type : '';
+  return `<li>
+    <div class="left">
+      <span class="dot ${n.status}"></span>
+      <span class="name">${n.name}</span>
+    </div>
+    <span class="label">${typeLabel}</span>
+  </li>`;
+}
+
+async function refresh() {
+  const errorEl = document.getElementById('error');
+  try {
+    const res = await fetch('/api/status', { cache: 'no-store' });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const data = await res.json();
+
+    if (data.title) {
+      document.title = data.title;
+      document.getElementById('title').textContent = data.title;
+    }
+
+    document.getElementById('services').innerHTML =
+      data.services.map(renderService).join('') ||
+      '<li><span class="meta">Keine Ingress-Hosts gefunden</span></li>';
+
+    document.getElementById('nodes').innerHTML =
+      data.nodes.map(renderNode).join('');
+
+    document.querySelector('.subtitle').textContent =
+      data.services.length + ' Services · ' + data.nodes.length + ' Nodes';
+
+    document.getElementById('updated').textContent =
+      'Stand: ' + new Date(data.updatedAt).toLocaleTimeString('de-DE');
+
+    errorEl.textContent = '';
+  } catch (err) {
+    errorEl.innerHTML = `<div class="error">Status konnte nicht geladen werden: ${err.message}</div>`;
+  }
+}
+
+refresh();
+setInterval(refresh, REFRESH_MS);
+</script>
+</body>
+</html>
