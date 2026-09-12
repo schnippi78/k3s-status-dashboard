@@ -1,5 +1,7 @@
 const express = require('express');
 const net = require('net');
+const http = require('http');
+const https = require('https');
 const path = require('path');
 const fs = require('fs');
 
@@ -26,10 +28,13 @@ const OK_HTTP = new Set([200, 301, 302, 307, 308, 401, 403]);
 //     "title": "My Status",
 //     "prometheusUrl": "http://prometheus.monitoring.svc.cluster.local:9090",
 //     "services": [
-//       { "name": "Nextcloud", "http": "http://nextcloud.nextcloud.svc.cluster.local/status.php" },
+//       { "name": "Nextcloud", "http": "http://nextcloud.nextcloud.svc.cluster.local/status.php", "host": "cloud.example.com" },
 //       { "name": "Mail (SMTP)", "tcp": "smtp.mail.svc.cluster.local:25" }
 //     ]
 //   }
+//
+// Optionale Felder pro http-Eintrag: "okStatus" (erlaubte Codes) und "host"
+// (Host-Header, falls der Dienst per trusted_domains einen bestimmten Host will).
 //
 // Dienste werden AKTIV geprüft: "http" per GET (ohne Redirects zu folgen),
 // "tcp" per Connect. Nodes kommen – falls prometheusUrl gesetzt ist – aus
@@ -65,20 +70,46 @@ const SERVICES = Array.isArray(config.services) ? config.services : [];
 // ---------------------------------------------------------------------------
 // Aktive Dienst-Prüfungen
 // ---------------------------------------------------------------------------
-async function probeHttp(url, okSet) {
-  try {
-    // redirect:'manual' -> 3xx bleibt 3xx (wir folgen nicht, werten aber als "ok").
-    const res = await fetch(url, {
-      redirect: 'manual',
-      signal: AbortSignal.timeout(PROBE_TIMEOUT),
+// http/https statt fetch: erlaubt das Setzen des Host-Headers (bei fetch/undici
+// ist "Host" ein verbotener Header) und folgt Redirects nicht (3xx bleibt 3xx).
+function probeHttp(rawUrl, okSet, hostHeader) {
+  return new Promise((resolve) => {
+    let target;
+    try {
+      target = new URL(rawUrl);
+    } catch (err) {
+      resolve({ status: 'unbekannt', detail: 'ungültige URL' });
+      return;
+    }
+    const lib = target.protocol === 'https:' ? https : http;
+    const options = {
+      method: 'GET',
+      timeout: PROBE_TIMEOUT,
+      // interne Dienste haben oft self-signed Certs -> nicht hart abbrechen
+      rejectUnauthorized: false,
+    };
+    // Manche Dienste (z. B. Nextcloud trusted_domains) weisen einen fremden
+    // Host-Header mit 400 ab -> per Config den erlaubten Host mitschicken.
+    if (hostHeader) options.headers = { Host: hostHeader };
+
+    let done = false;
+    const finish = (result) => {
+      if (done) return;
+      done = true;
+      resolve(result);
+    };
+    const req = lib.request(target, options, (res) => {
+      res.resume(); // Body verwerfen, Socket freigeben
+      const code = res.statusCode;
+      finish({ status: okSet.has(code) ? 'ok' : 'down', detail: 'HTTP ' + code });
     });
-    const code = res.status;
-    return { status: okSet.has(code) ? 'ok' : 'down', detail: 'HTTP ' + code };
-  } catch (err) {
-    if (err.name === 'TimeoutError') return { status: 'down', detail: 'timeout' };
-    const code = (err.cause && err.cause.code) || err.code || err.name || 'error';
-    return { status: 'down', detail: String(code).toLowerCase() };
-  }
+    req.on('timeout', () => {
+      req.destroy();
+      finish({ status: 'down', detail: 'timeout' });
+    });
+    req.on('error', (err) => finish({ status: 'down', detail: (err.code || 'error').toLowerCase() }));
+    req.end();
+  });
 }
 
 function probeTcp(hostport) {
@@ -111,7 +142,7 @@ async function getServices() {
     SERVICES.map(async (s) => {
       const okSet = Array.isArray(s.okStatus) ? new Set(s.okStatus) : OK_HTTP;
       let result;
-      if (s.http) result = await probeHttp(s.http, okSet);
+      if (s.http) result = await probeHttp(s.http, okSet, s.host);
       else if (s.tcp) result = await probeTcp(s.tcp);
       else result = { status: 'unbekannt', detail: 'keine Prüfung' };
       return { name: s.name, status: result.status, detail: result.detail };
