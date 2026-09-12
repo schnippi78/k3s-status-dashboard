@@ -1,14 +1,14 @@
 # Minimal example for deploying k3s-status-dashboard on Kubernetes / k3s.
 #
-# It needs read-only access to the cluster API: nodes, ingresses, services and
-# endpoints (and optionally Traefik IngressRoute CRDs). The ServiceAccount +
-# ClusterRole below grant exactly that — nothing that can create, update or
-# delete anything.
+# This dashboard does NOT talk to the cluster API — it actively probes your
+# services (HTTP/TCP via their in-cluster Service DNS) and optionally reads node
+# health from Prometheus. So it needs no ServiceAccount, no RBAC: just a
+# Deployment, a Service, and a config with the services to watch.
 #
 #   kubectl apply -f deploy.example.yaml
 #
-# Then reach it via port-forward, a Service of type LoadBalancer, or your own
-# Ingress (an example Ingress is included at the bottom, commented out).
+# Reach it via port-forward, a LoadBalancer Service, or your own Ingress /
+# Traefik IngressRoute (examples at the bottom, commented out).
 ---
 apiVersion: v1
 kind: Namespace
@@ -16,39 +16,22 @@ metadata:
   name: status
 ---
 apiVersion: v1
-kind: ServiceAccount
+kind: ConfigMap
 metadata:
-  name: status-dashboard
+  name: status-dashboard-config
   namespace: status
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
-metadata:
-  name: status-dashboard-read
-rules:
-  - apiGroups: [""]
-    resources: ["nodes", "services", "endpoints"]
-    verbs: ["get", "list"]
-  - apiGroups: ["networking.k8s.io"]
-    resources: ["ingresses"]
-    verbs: ["get", "list"]
-  # Optional: Traefik IngressRoute-Erkennung. Schadet nicht, wenn das CRD fehlt.
-  - apiGroups: ["traefik.io", "traefik.containo.us"]
-    resources: ["ingressroutes"]
-    verbs: ["get", "list"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: status-dashboard-read
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
-  name: status-dashboard-read
-subjects:
-  - kind: ServiceAccount
-    name: status-dashboard
-    namespace: status
+data:
+  config.json: |
+    {
+      "title": "My Homelab Status",
+      "prometheusUrl": "http://prometheus.monitoring.svc.cluster.local:9090",
+      "services": [
+        { "name": "Nextcloud", "http": "http://nextcloud.nextcloud.svc.cluster.local/status.php" },
+        { "name": "Grafana", "http": "http://grafana.monitoring.svc.cluster.local:3000/api/health" },
+        { "name": "Mail (SMTP)", "tcp": "smtp.mail.svc.cluster.local:25" },
+        { "name": "Mail (IMAP)", "tcp": "imap.mail.svc.cluster.local:143" }
+      ]
+    }
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -65,36 +48,38 @@ spec:
       labels:
         app: status-dashboard
     spec:
-      serviceAccountName: status-dashboard
       containers:
         - name: status-dashboard
           image: schnippi78/k3s-status-dashboard:latest
           ports:
             - containerPort: 3000
           env:
-            - name: DASHBOARD_TITLE
-              value: "My Homelab Status"
-            # Optional: nur einen Namespace anzeigen
-            # - name: NAMESPACE
-            #   value: "default"
-            # Optional: kuratierte Config inline (statt Auto-Modus)
+            - name: CONFIG_PATH
+              value: /app/config.json
+            # Or skip the ConfigMap and pass everything inline:
             # - name: SERVICES_CONFIG
-            #   value: '{"title":"Inline","services":[{"name":"Pi","host":"pi.example.com"}]}'
-          # Optional: kuratierte Config aus einer ConfigMap mounten
-          # volumeMounts:
-          #   - name: config
-          #     mountPath: /app/config.json
-          #     subPath: config.json
+            #   value: '{"title":"Inline","services":[{"name":"Pi","http":"http://pi.default.svc.cluster.local/"}]}'
+            # - name: PROBE_TIMEOUT
+            #   value: "3000"
+          volumeMounts:
+            - name: config
+              mountPath: /app/config.json
+              subPath: config.json
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            periodSeconds: 30
           resources:
             requests:
               cpu: 10m
               memory: 32Mi
             limits:
               memory: 64Mi
-      # volumes:
-      #   - name: config
-      #     configMap:
-      #       name: status-dashboard-config
+      volumes:
+        - name: config
+          configMap:
+            name: status-dashboard-config
 ---
 apiVersion: v1
 kind: Service
@@ -108,8 +93,23 @@ spec:
     - port: 80
       targetPort: 3000
 # ---
-# Optional: expose via Ingress (Traefik). Put it behind auth before opening it
-# to the public internet — the dashboard has no auth of its own.
+# Optional: expose via Traefik IngressRoute (k3s default ingress).
+# Put it behind auth before opening it to the public internet.
+# apiVersion: traefik.io/v1alpha1
+# kind: IngressRoute
+# metadata:
+#   name: status-dashboard
+#   namespace: status
+# spec:
+#   entryPoints: [websecure]
+#   routes:
+#     - match: Host(`status.example.com`)
+#       kind: Rule
+#       services:
+#         - name: status-dashboard
+#           port: 80
+# ---
+# Optional: expose via standard Ingress instead.
 # apiVersion: networking.k8s.io/v1
 # kind: Ingress
 # metadata:

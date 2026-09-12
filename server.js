@@ -1,36 +1,17 @@
 const express = require('express');
-const k8s = require('@kubernetes/client-node');
+const net = require('net');
 const path = require('path');
 const fs = require('fs');
-
-// ---------------------------------------------------------------------------
-// Kubernetes-Client
-//
-// In-Cluster: liest Token + CA aus dem gemounteten ServiceAccount.
-// Lokal (Entwicklung): fällt auf die Default-Kubeconfig zurück (KUBECONFIG /
-// ~/.kube/config).
-// ---------------------------------------------------------------------------
-const kc = new k8s.KubeConfig();
-try {
-  kc.loadFromCluster();
-} catch (err) {
-  kc.loadFromDefault();
-}
-const coreApi = kc.makeApiClient(k8s.CoreV1Api);
-const netApi = kc.makeApiClient(k8s.NetworkingV1Api);
-const customApi = kc.makeApiClient(k8s.CustomObjectsApi);
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Optionaler Namespace-Filter: nur Hosts/Services aus diesem Namespace.
-const NAMESPACE = process.env.NAMESPACE || null;
+// Timeout pro Probe (ms).
+const PROBE_TIMEOUT = parseInt(process.env.PROBE_TIMEOUT || '3000', 10);
 
-const HOST_REGEX = /Host\(`([^`]+)`\)/g;
-
-// Kompatibel zu Client-Versionen, die { body } zurückgeben, und solchen, die
-// das Objekt direkt liefern.
-const unwrap = (res) => (res && res.body !== undefined ? res.body : res);
+// HTTP-Statuscodes, die als "erreichbar" gelten (Redirects/Auth-Gates zählen als
+// "Dienst antwortet"). Pro Service über "okStatus" überschreibbar.
+const OK_HTTP = new Set([200, 301, 302, 307, 308, 401, 403]);
 
 // ---------------------------------------------------------------------------
 // Konfiguration
@@ -38,20 +19,21 @@ const unwrap = (res) => (res && res.body !== undefined ? res.body : res);
 // Drei Quellen, in dieser Reihenfolge:
 //   1. SERVICES_CONFIG  – JSON direkt als Env-Variable
 //   2. CONFIG_PATH / ./config.json  – JSON-Datei (z. B. per ConfigMap gemountet)
-//   3. keine Config     – Auto-Modus: alle Ingress-Hosts werden angezeigt
+//   3. keine Config     – leere Liste (nichts zu prüfen)
 //
 // Config-Schema:
 //   {
 //     "title": "My Status",
+//     "prometheusUrl": "http://prometheus.monitoring.svc.cluster.local:9090",
 //     "services": [
-//       { "name": "Nextcloud", "host": "cloud.example.com" },
-//       { "name": "Mail", "k8sServices": ["mail/front", "mail/imap"] }
+//       { "name": "Nextcloud", "http": "http://nextcloud.nextcloud.svc.cluster.local/status.php" },
+//       { "name": "Mail (SMTP)", "tcp": "smtp.mail.svc.cluster.local:25" }
 //     ]
 //   }
 //
-// Ein Service-Eintrag matcht entweder über "host" (Ingress-/IngressRoute-Host)
-// oder über "k8sServices" (Liste von "namespace/service", die aggregiert werden).
-// Die Reihenfolge im Array bestimmt die Reihenfolge im Dashboard.
+// Dienste werden AKTIV geprüft: "http" per GET (ohne Redirects zu folgen),
+// "tcp" per Connect. Nodes kommen – falls prometheusUrl gesetzt ist – aus
+// Prometheus (kube_node_status_condition), sonst bleibt die Node-Liste leer.
 // ---------------------------------------------------------------------------
 function loadConfig() {
   const inline = process.env.SERVICES_CONFIG;
@@ -77,182 +59,95 @@ function loadConfig() {
 
 const config = loadConfig();
 const TITLE = process.env.DASHBOARD_TITLE || config.title || 'k3s Status';
-const SERVICE_CONFIG = Array.isArray(config.services) ? config.services : null;
-
-function serviceStatus(running, desired) {
-  if (desired === 0) return 'unbekannt';
-  if (running >= desired) return 'ok';
-  if (running > 0) return 'eingeschränkt';
-  return 'down';
-}
-
-function nodeStatus(conditions) {
-  const ready = (conditions || []).find((c) => c.type === 'Ready');
-  return ready && ready.status === 'True' ? 'ready' : 'down';
-}
+const PROMETHEUS_URL = (process.env.PROMETHEUS_URL || config.prometheusUrl || '').replace(/\/+$/, '');
+const SERVICES = Array.isArray(config.services) ? config.services : [];
 
 // ---------------------------------------------------------------------------
-// Host-Erkennung
-//
-// Zwei Quellen, zusammengeführt:
-//   * Standard-Ingress (networking.k8s.io/v1): spec.rules[].host
-//   * Traefik IngressRoute (CRD): spec.routes[].match -> Host(`...`)
-//
-// Jeder Host wird auf seinen Backend-Service (namespace/name) gemappt, dessen
-// Endpoints dann ready/total liefern.
+// Aktive Dienst-Prüfungen
 // ---------------------------------------------------------------------------
-function matchHosts(rule) {
-  const hosts = [];
-  let m;
-  HOST_REGEX.lastIndex = 0;
-  while ((m = HOST_REGEX.exec(rule)) !== null) hosts.push(m[1]);
-  return hosts;
-}
-
-async function discoverHosts() {
-  const hosts = new Map(); // host -> { namespace, service }
-
-  // 1. Standard-Ingress
+async function probeHttp(url, okSet) {
   try {
-    const res = NAMESPACE
-      ? await netApi.listNamespacedIngress(NAMESPACE)
-      : await netApi.listIngressForAllNamespaces();
-    for (const ing of unwrap(res).items || []) {
-      const ns = ing.metadata.namespace;
-      for (const rule of (ing.spec && ing.spec.rules) || []) {
-        if (!rule.host) continue;
-        let service = null;
-        for (const p of (rule.http && rule.http.paths) || []) {
-          if (p.backend && p.backend.service && p.backend.service.name) {
-            service = p.backend.service.name;
-            break;
-          }
-        }
-        if (!hosts.has(rule.host)) hosts.set(rule.host, { namespace: ns, service });
-      }
-    }
+    // redirect:'manual' -> 3xx bleibt 3xx (wir folgen nicht, werten aber als "ok").
+    const res = await fetch(url, {
+      redirect: 'manual',
+      signal: AbortSignal.timeout(PROBE_TIMEOUT),
+    });
+    const code = res.status;
+    return { status: okSet.has(code) ? 'ok' : 'down', detail: 'HTTP ' + code };
   } catch (err) {
-    console.error('Ingress-Discovery fehlgeschlagen:', err.message);
-  }
-
-  // 2. Traefik IngressRoute (CRD, optional – Gruppe je nach Traefik-Version)
-  const traefikGroups = ['traefik.io', 'traefik.containo.us'];
-  for (const group of traefikGroups) {
-    try {
-      const res = NAMESPACE
-        ? await customApi.listNamespacedCustomObject(group, 'v1alpha1', NAMESPACE, 'ingressroutes')
-        : await customApi.listCustomObjectForAllNamespaces(group, 'v1alpha1', 'ingressroutes');
-      const items = unwrap(res).items || [];
-      for (const ir of items) {
-        const ns = ir.metadata.namespace;
-        for (const route of (ir.spec && ir.spec.routes) || []) {
-          const service =
-            (route.services && route.services[0] && route.services[0].name) || null;
-          for (const host of matchHosts(route.match || '')) {
-            if (!hosts.has(host)) hosts.set(host, { namespace: ns, service });
-          }
-        }
-      }
-      if (items.length) break; // passende Gruppe gefunden
-    } catch (err) {
-      // CRD-Gruppe existiert nicht -> nächste probieren / still ignorieren
-    }
-  }
-
-  return hosts;
-}
-
-// Ready-/Gesamt-Backends eines Service aus seinen Endpoints.
-async function endpointsCount(namespace, service) {
-  if (!service) return { running: 0, desired: 0 };
-  try {
-    const res = await coreApi.readNamespacedEndpoints(service, namespace);
-    const ep = unwrap(res);
-    let ready = 0;
-    let notReady = 0;
-    for (const s of ep.subsets || []) {
-      ready += (s.addresses || []).length;
-      notReady += (s.notReadyAddresses || []).length;
-    }
-    return { running: ready, desired: ready + notReady };
-  } catch (err) {
-    return { running: 0, desired: 0 };
+    if (err.name === 'TimeoutError') return { status: 'down', detail: 'timeout' };
+    const code = (err.cause && err.cause.code) || err.code || err.name || 'error';
+    return { status: 'down', detail: String(code).toLowerCase() };
   }
 }
 
-// "namespace/service" oder nur "service" (dann Default-Namespace / NAMESPACE).
-function splitRef(ref) {
-  const idx = ref.indexOf('/');
-  if (idx === -1) return { namespace: NAMESPACE || 'default', service: ref };
-  return { namespace: ref.slice(0, idx), service: ref.slice(idx + 1) };
+function probeTcp(hostport) {
+  return new Promise((resolve) => {
+    const idx = hostport.lastIndexOf(':');
+    const host = hostport.slice(0, idx);
+    const port = parseInt(hostport.slice(idx + 1), 10);
+    if (!host || !port) {
+      resolve({ status: 'unbekannt', detail: 'ungültig' });
+      return;
+    }
+    const sock = new net.Socket();
+    let done = false;
+    const finish = (result) => {
+      if (done) return;
+      done = true;
+      sock.destroy();
+      resolve(result);
+    };
+    sock.setTimeout(PROBE_TIMEOUT);
+    sock.once('connect', () => finish({ status: 'ok', detail: 'tcp ' + port }));
+    sock.once('timeout', () => finish({ status: 'down', detail: 'timeout' }));
+    sock.once('error', (err) => finish({ status: 'down', detail: (err.code || 'error').toLowerCase() }));
+    sock.connect(port, host);
+  });
 }
 
 async function getServices() {
-  const hosts = await discoverHosts();
-
-  // Auto-Modus: keine Config -> alle Ingress-Hosts anzeigen.
-  if (!SERVICE_CONFIG) {
-    const out = [];
-    for (const [host, ref] of hosts) {
-      const { running, desired } = await endpointsCount(ref.namespace, ref.service);
-      out.push({ name: host, running, desired, status: serviceStatus(running, desired) });
-    }
-    return out.sort((a, b) => a.name.localeCompare(b.name));
-  }
-
-  // Kuratierter Modus: Namen und Reihenfolge kommen aus der Config.
-  const out = [];
-  for (const entry of SERVICE_CONFIG) {
-    // Aggregation mehrerer Services (z. B. Mail = front + imap + smtp).
-    if (Array.isArray(entry.k8sServices)) {
-      let running = 0;
-      let desired = 0;
-      for (const ref of entry.k8sServices) {
-        const { namespace, service } = splitRef(ref);
-        const c = await endpointsCount(namespace, service);
-        running += c.running;
-        desired += c.desired;
-      }
-      out.push({ name: entry.name, running, desired, status: serviceStatus(running, desired) });
-      continue;
-    }
-
-    // Einzelner Service über seinen Host.
-    const ref = hosts.get(entry.host);
-    if (!ref) {
-      out.push({ name: entry.name || entry.host, running: 0, desired: 0, status: 'unbekannt' });
-      continue;
-    }
-    const { running, desired } = await endpointsCount(ref.namespace, ref.service);
-    out.push({
-      name: entry.name || entry.host,
-      running,
-      desired,
-      status: serviceStatus(running, desired),
-    });
-  }
-  return out;
+  return Promise.all(
+    SERVICES.map(async (s) => {
+      const okSet = Array.isArray(s.okStatus) ? new Set(s.okStatus) : OK_HTTP;
+      let result;
+      if (s.http) result = await probeHttp(s.http, okSet);
+      else if (s.tcp) result = await probeTcp(s.tcp);
+      else result = { status: 'unbekannt', detail: 'keine Prüfung' };
+      return { name: s.name, status: result.status, detail: result.detail };
+    })
+  );
 }
 
+// ---------------------------------------------------------------------------
+// Nodes über Prometheus (kube-state-metrics). Optional: ohne PROMETHEUS_URL
+// bleibt die Node-Liste leer.
+// ---------------------------------------------------------------------------
 async function getNodes() {
-  const res = await coreApi.listNode();
-  return (unwrap(res).items || [])
-    .map((node) => {
-      const labels = (node.metadata && node.metadata.labels) || {};
-      const roles = Object.keys(labels)
-        .filter((k) => k.startsWith('node-role.kubernetes.io/'))
-        .map((k) => k.slice('node-role.kubernetes.io/'.length))
-        .filter(Boolean);
-      const role = roles.length ? roles.join(',') : 'worker';
-      return {
-        name: node.metadata.name,
-        role,
-        // Anzeige-Label: eigenes "type"-Label bevorzugt, sonst die Rolle.
-        type: labels.type || role,
-        status: nodeStatus(node.status && node.status.conditions),
-      };
-    })
-    .sort((a, b) => a.name.localeCompare(b.name));
+  if (!PROMETHEUS_URL) return [];
+  try {
+    const url =
+      PROMETHEUS_URL +
+      '/api/v1/query?query=' +
+      encodeURIComponent('kube_node_status_condition{condition="Ready"}');
+    const res = await fetch(url, { signal: AbortSignal.timeout(PROBE_TIMEOUT) });
+    const json = await res.json();
+    const out = {};
+    for (const series of (json.data && json.data.result) || []) {
+      const node = (series.metric && series.metric.node) || '?';
+      const cond = (series.metric && series.metric.status) || '';
+      const value = series.value && series.value[1];
+      if (!(node in out)) out[node] = 'unbekannt';
+      if (cond === 'true' && value === '1') out[node] = 'ready';
+      else if (cond === 'false' && value === '1' && out[node] !== 'ready') out[node] = 'down';
+    }
+    return Object.keys(out)
+      .sort()
+      .map((name) => ({ name, status: out[name] }));
+  } catch (err) {
+    console.error('Prometheus-Abfrage fehlgeschlagen:', err.message);
+    return [];
+  }
 }
 
 app.get('/api/status', async (req, res) => {
@@ -260,10 +155,12 @@ app.get('/api/status', async (req, res) => {
     const [services, nodes] = await Promise.all([getServices(), getNodes()]);
     res.json({ title: TITLE, services, nodes, updatedAt: new Date().toISOString() });
   } catch (err) {
-    console.error('Fehler beim Abfragen der Kubernetes-API:', err.message);
-    res.status(500).json({ error: 'Kubernetes-API nicht erreichbar' });
+    console.error('Fehler beim Erzeugen des Status:', err.message);
+    res.status(500).json({ error: 'Status konnte nicht ermittelt werden' });
   }
 });
+
+app.get('/health', (req, res) => res.type('text').send('ok\n'));
 
 app.use(express.static(path.join(__dirname, 'public')));
 
