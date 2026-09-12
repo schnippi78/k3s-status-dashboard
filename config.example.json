@@ -2,7 +2,7 @@
   "title": "My Homelab Status",
   "prometheusUrl": "http://prometheus.monitoring.svc.cluster.local:9090",
   "services": [
-    { "name": "Nextcloud", "http": "http://nextcloud.nextcloud.svc.cluster.local/status.php" },
+    { "name": "Nextcloud", "http": "http://nextcloud.nextcloud.svc.cluster.local/status.php", "host": "cloud.example.com" },
     { "name": "Home Assistant", "http": "http://home-assistant.home.svc.cluster.local:8123/" },
     { "name": "Grafana", "http": "http://grafana.monitoring.svc.cluster.local:3000/api/health" },
     { "name": "Mail (SMTP)", "tcp": "smtp.mail.svc.cluster.local:25" },

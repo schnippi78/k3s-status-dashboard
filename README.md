@@ -67,7 +67,9 @@ Each service entry is probed one of two ways:
 
 - **`http`** – an HTTP `GET`. `200/301/302/307/308/401/403` count as **up**
   (redirects and auth challenges mean the service is answering). Override the
-  accepted codes per entry with `"okStatus": [200, 204]`.
+  accepted codes per entry with `"okStatus": [200, 204]`. If the service checks
+  the `Host` header (e.g. Nextcloud's `trusted_domains` rejects an unknown host
+  with `400`), set `"host": "cloud.example.com"` to send the accepted host.
 - **`tcp`** – a `host:port` TCP connect. A successful connection is **up**.
 
 The array order is the display order. `prometheusUrl` (or the `PROMETHEUS_URL`
