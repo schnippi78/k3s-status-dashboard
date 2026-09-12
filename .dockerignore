@@ -1,0 +1,9 @@
+node_modules
+npm-debug.log
+.git
+.gitignore
+.DS_Store
+config.json
+deploy*.yaml
+*.md
+LICENSE
