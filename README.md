@@ -4,44 +4,40 @@
 [![Docker Image](https://img.shields.io/badge/Docker%20Hub-schnippi78%2Fk3s--status--dashboard-2496ED?logo=docker&logoColor=white)](https://hub.docker.com/r/schnippi78/k3s-status-dashboard)
 ![Node](https://img.shields.io/badge/node-20-339933?logo=node.js&logoColor=white)
 
-A tiny status dashboard for **Kubernetes / k3s**. It reads your Ingress hosts and
-nodes straight from the Kubernetes API and renders them on a single clean, dark
-page — auto-refreshing every 30 seconds. No database, no agents, no external
-services.
+A tiny status dashboard for **Kubernetes / k3s**. It **actively probes** your
+services (HTTP/TCP via their in-cluster Service DNS) and reads node health from
+**Prometheus**, then renders everything on a single clean, dark page —
+auto-refreshing every 30 seconds. No database, no agents.
 
-- **Services** are discovered via **Ingress** hosts and Traefik **IngressRoute**
-  `Host(...)` rules, then mapped to their backend Service's endpoints
-  (ready/total).
-- **Nodes** are listed with their role, an optional `type` label, and readiness.
-- **Zero-config by default**: without any configuration it simply shows *every*
-  Ingress host. Add a config only if you want to curate names, order, or
-  aggregate several services into one entry.
+- **Services** are checked by actually talking to them: an HTTP `GET` (redirects
+  and auth gates count as "up") or a raw TCP connect. What answers is green.
+- **Nodes** come from Prometheus (`kube_node_status_condition`) — optional; leave
+  it out and the dashboard just shows services.
+- **No cluster API access**: it does not read the Kubernetes API, so it needs
+  **no ServiceAccount and no RBAC**. Just point it at the services you care about.
 
 > This is the Kubernetes/k3s sibling of
 > [swarm-status-dashboard](https://github.com/schnippi78/swarm-status-dashboard)
-> — same dashboard, Docker Swarm edition.
+> — same look, Docker Swarm edition (which reads the Docker API instead).
 
 ## Quick start
 
 ```bash
-kubectl apply -f deploy.example.yaml
+kubectl apply -f deploy.example.yaml   # edit the ConfigMap first
 kubectl -n status port-forward deploy/status-dashboard 8080:3000
 ```
 
-Open <http://localhost:8080>. This immediately lists all your Ingress hosts and
-cluster nodes.
-
-The dashboard talks to the cluster API using its ServiceAccount. The included
-manifest grants **read-only** access (nodes, ingresses, services, endpoints, and
-optionally Traefik IngressRoutes) — nothing else.
+Open <http://localhost:8080>. Edit the `services` list in the ConfigMap to match
+your cluster (see below).
 
 ## Configuration
 
-Everything is optional. Configuration is resolved in this order:
+Because it probes actively, the dashboard needs to be told **what** to watch.
+Configuration is resolved in this order:
 
 1. `SERVICES_CONFIG` – JSON passed directly as an environment variable
 2. `CONFIG_PATH` / `./config.json` – a JSON file (e.g. mounted from a ConfigMap)
-3. no config – auto mode: every Ingress host is shown, sorted alphabetically
+3. no config – empty list (nothing to check)
 
 ### Environment variables
 
@@ -50,71 +46,69 @@ Everything is optional. Configuration is resolved in this order:
 | `DASHBOARD_TITLE` | `k3s Status`   | Title shown in the header and browser tab                |
 | `CONFIG_PATH`     | `./config.json`| Path to a JSON config file                               |
 | `SERVICES_CONFIG` | –              | Inline JSON config (overrides the file)                  |
-| `NAMESPACE`       | – (all)        | Restrict discovery to a single namespace                 |
+| `PROMETHEUS_URL`  | – (no nodes)   | Prometheus base URL for the node section                 |
+| `PROBE_TIMEOUT`   | `3000`         | Per-probe timeout in milliseconds                        |
 | `PORT`            | `3000`         | Port the server listens on inside the container          |
-| `KUBECONFIG`      | in-cluster     | Only for out-of-cluster/dev: path to a kubeconfig        |
 
 ### Config file schema
 
 ```json
 {
   "title": "My Homelab Status",
+  "prometheusUrl": "http://prometheus.monitoring.svc.cluster.local:9090",
   "services": [
-    { "name": "Nextcloud", "host": "cloud.example.com" },
-    { "name": "PiHole", "host": "pihole.example.com" },
-    { "name": "Mail", "k8sServices": ["mail/front", "mail/imap", "mail/smtp"] }
+    { "name": "Nextcloud", "http": "http://nextcloud.nextcloud.svc.cluster.local/status.php" },
+    { "name": "Mail (SMTP)", "tcp": "smtp.mail.svc.cluster.local:25" }
   ]
 }
 ```
 
-Each service entry matches in one of two ways:
+Each service entry is probed one of two ways:
 
-- **`host`** – matches a discovered Ingress / IngressRoute `Host(...)`.
-- **`k8sServices`** – a list of `namespace/service` names whose endpoints are
-  aggregated into a single entry (useful for things like mail, where several
-  services form one logical service). A bare `service` uses `NAMESPACE` or
-  `default`.
+- **`http`** – an HTTP `GET`. `200/301/302/307/308/401/403` count as **up**
+  (redirects and auth challenges mean the service is answering). Override the
+  accepted codes per entry with `"okStatus": [200, 204]`.
+- **`tcp`** – a `host:port` TCP connect. A successful connection is **up**.
 
-The array order is the display order. `title` sets the header; the
-`DASHBOARD_TITLE` env variable takes precedence if both are set.
+The array order is the display order. `prometheusUrl` (or the `PROMETHEUS_URL`
+env var) enables the Nodes section; without it, only services are shown.
 
 See [`config.example.json`](config.example.json) and
 [`deploy.example.yaml`](deploy.example.yaml) for full examples.
 
-## How status is derived
+## Status colours
 
-For each host the dashboard resolves the backend Service and reads its
-**Endpoints**: `running` = ready backend addresses, `desired` = ready + not-ready.
+- **green** – `ok` (HTTP code accepted, or TCP connected)
+- **red** – `down` (bad HTTP code, timeout, connection refused, DNS failure)
+- **grey** – `unknown` (nothing to probe / node condition unknown)
 
-- `running >= desired` → **ok** (green)
-- `0 < running < desired` → **degraded** (yellow)
-- `running == 0`, `desired > 0` → **down** (red)
-- `desired == 0` (nothing scheduled / host not matched) → **unknown** (grey)
+Nodes: **green** ready, **red** not-ready.
 
 ## Deploying
 
-`kubectl apply -f deploy.example.yaml` creates a `status` namespace, a
-read-only ServiceAccount/ClusterRole, the Deployment and a Service. Expose it via
-`port-forward`, a `LoadBalancer` Service, or your own Ingress (an example Ingress
-is included, commented out, at the bottom of the manifest).
+`kubectl apply -f deploy.example.yaml` creates a `status` namespace, a ConfigMap
+with your service list, the Deployment and a Service. Expose it via
+`port-forward`, a `LoadBalancer` Service, or your own Ingress / Traefik
+IngressRoute (examples are included, commented out, at the bottom of the
+manifest).
 
 ## Security note
 
-This dashboard reads your cluster state through a ServiceAccount. The provided
-RBAC is **read-only** (`get`, `list`) and scoped to nodes, ingresses, services
-and endpoints — it never creates, updates, or removes anything. Do not expose the
-dashboard to the public internet without authentication (put it behind your
-reverse proxy / an auth middleware).
+The dashboard only makes outbound probes to the hosts you list and (optionally)
+queries Prometheus. It never reads or writes the cluster API. Still, don't expose
+it to the public internet without authentication — put it behind your reverse
+proxy / an auth middleware.
 
 ## Development
 
 ```bash
 npm install
-npm start   # serves on http://localhost:3000, using your ~/.kube/config
+CONFIG_PATH=./config.example.json npm start   # http://localhost:3000
 ```
 
-Out of cluster it uses your current kubeconfig context, so point `kubectl` at the
-cluster you want to see first.
+Probes run from wherever the process runs, so for real in-cluster DNS names
+(`*.svc.cluster.local`) run it inside the cluster; locally, point the config at
+reachable URLs/hosts.
 
 ## License
 

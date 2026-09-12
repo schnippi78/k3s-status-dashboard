@@ -100,8 +100,10 @@
   <h2>Services</h2>
   <ul id="services"></ul>
 
-  <h2>Nodes</h2>
-  <ul id="nodes"></ul>
+  <div id="nodes-section" hidden>
+    <h2>Nodes</h2>
+    <ul id="nodes"></ul>
+  </div>
 
   <footer>
     <span id="updated"></span>
@@ -118,18 +120,17 @@ function renderService(s) {
       <span class="dot ${s.status}"></span>
       <span class="name">${s.name}</span>
     </div>
-    <span class="meta">${s.running}/${s.desired}</span>
+    <span class="meta">${s.detail || s.status}</span>
   </li>`;
 }
 
 function renderNode(n) {
-  const typeLabel = n.type ? n.type : '';
   return `<li>
     <div class="left">
       <span class="dot ${n.status}"></span>
       <span class="name">${n.name}</span>
     </div>
-    <span class="label">${typeLabel}</span>
+    <span class="label">${n.status}</span>
   </li>`;
 }
 
@@ -147,13 +148,17 @@ async function refresh() {
 
     document.getElementById('services').innerHTML =
       data.services.map(renderService).join('') ||
-      '<li><span class="meta">Keine Ingress-Hosts gefunden</span></li>';
+      '<li><span class="meta">Keine Dienste konfiguriert (SERVICES setzen)</span></li>';
 
+    // Nodes-Sektion nur zeigen, wenn Prometheus Nodes liefert.
+    const hasNodes = data.nodes && data.nodes.length > 0;
+    document.getElementById('nodes-section').hidden = !hasNodes;
     document.getElementById('nodes').innerHTML =
-      data.nodes.map(renderNode).join('');
+      hasNodes ? data.nodes.map(renderNode).join('') : '';
 
     document.querySelector('.subtitle').textContent =
-      data.services.length + ' Services · ' + data.nodes.length + ' Nodes';
+      data.services.length + ' Services' +
+      (hasNodes ? ' · ' + data.nodes.length + ' Nodes' : '');
 
     document.getElementById('updated').textContent =
       'Stand: ' + new Date(data.updatedAt).toLocaleTimeString('de-DE');
